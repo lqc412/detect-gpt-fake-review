@@ -219,11 +219,14 @@ def compute_binary_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     y_prob: Optional[np.ndarray],
+    *,
+    pos_label: int = 0,
 ) -> Dict[str, float]:
     precision, recall, f1, _ = precision_recall_fscore_support(
         y_true,
         y_pred,
         average="binary",
+        pos_label=pos_label,
         zero_division=0,
     )
     metrics = {
@@ -234,7 +237,8 @@ def compute_binary_metrics(
     }
     if y_prob is not None and len(np.unique(y_true)) > 1:
         try:
-            metrics["roc_auc"] = roc_auc_score(y_true, y_prob)
+            y_true_binary = (y_true == pos_label).astype(int)
+            metrics["roc_auc"] = roc_auc_score(y_true_binary, y_prob)
         except ValueError:
             metrics["roc_auc"] = float("nan")
     else:
@@ -344,9 +348,17 @@ def run_classical_training(args: argparse.Namespace, df: pd.DataFrame) -> List[D
         model.fit(X_train, y[train_idx])
 
         y_pred = model.predict(X_val)
-        y_prob = model.predict_proba(X_val)[:, 1] if hasattr(model, "predict_proba") else None
+        if hasattr(model, "predict_proba"):
+            probas = model.predict_proba(X_val)
+            if probas.ndim == 2 and probas.shape[1] > 1:
+                class_indices = np.where(model.classes_ == 0)[0]
+                y_prob = probas[:, class_indices[0]] if class_indices.size else None
+            else:
+                y_prob = None
+        else:
+            y_prob = None
 
-        metrics = compute_binary_metrics(y[val_idx], y_pred, y_prob)
+        metrics = compute_binary_metrics(y[val_idx], y_pred, y_prob, pos_label=0)
         metrics["fold"] = fold_idx
         metrics["support"] = int(len(val_idx))
         per_fold_metrics.append(metrics)
@@ -495,9 +507,9 @@ def run_transformer_training(args: argparse.Namespace, df: pd.DataFrame) -> List
         logits = predictions.predictions
         probs = _softmax(logits)
         y_pred = probs.argmax(axis=1)
-        y_prob = probs[:, 1]
+        y_prob = probs[:, 0]
 
-        metrics = compute_binary_metrics(y[val_idx], y_pred, y_prob)
+        metrics = compute_binary_metrics(y[val_idx], y_pred, y_prob, pos_label=0)
         metrics["fold"] = fold_idx
         metrics["support"] = int(len(val_idx))
         per_fold_metrics.append(metrics)
