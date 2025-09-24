@@ -1,14 +1,17 @@
 import argparse
+import time
+from typing import Optional
+
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import transformers
-import numpy as np
-import time
-import my_custom_datasets
-import functools
-import tqdm
-import re
 from sklearn.metrics import roc_curve, precision_recall_curve, auc
-import matplotlib.pyplot as plt
+
+import functools
+import my_custom_datasets
+import re
+import tqdm
 
 # 15 colorblind-friendly colors
 COLORS = ["#0072B2", "#009E73", "#D55E00", "#CC79A7", "#F0E442",
@@ -16,11 +19,37 @@ COLORS = ["#0072B2", "#009E73", "#D55E00", "#CC79A7", "#F0E442",
             "#D55E00", "#CC79A7", "#F0E442", "#56B4E9", "#E69F00"]
 
 cache_dir = ".cache"
-DEVICE = "cuda"
+DEVICE = torch.device("cpu")
 n_perturbation_rounds = 1
 pattern = re.compile(r"<extra_id_\d+>")
 
-def load_mask_model_and_tokenizer(model_name: str, device: str):
+
+def select_device(requested: Optional[str]) -> torch.device:
+    """Select an appropriate torch device based on user preference and availability."""
+    if requested is None:
+        requested = "auto"
+
+    requested = requested.strip()
+    requested_lower = requested.lower()
+
+    if requested_lower == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if requested_lower == "cpu":
+        return torch.device("cpu")
+
+    device = torch.device(requested)
+
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA requested but not available")
+        if device.index is not None and device.index >= torch.cuda.device_count():
+            raise ValueError(f"CUDA device index {device.index} out of range")
+
+    return device
+
+
+def load_mask_model_and_tokenizer(model_name: str, device: torch.device):
     """Load mask filling model and tokenizer"""
     print(f'Loading mask filling model {model_name}...')
     mask_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(
@@ -34,22 +63,28 @@ def load_mask_model_and_tokenizer(model_name: str, device: str):
     )
     return mask_model, mask_tokenizer
 
-def load_mask_model(base_model, mask_model):
-    print('MOVING MASK MODEL TO GPU...', end='', flush=True)
+def load_mask_model(base_model, mask_model, device: torch.device):
+    device_label = str(device).upper()
+    print(f'MOVING MASK MODEL TO {device_label}...', end='', flush=True)
     start = time.time()
 
-    base_model.cpu()
-    mask_model.to(DEVICE)
+    if device.type == "cuda":
+        base_model.to("cpu")
+
+    mask_model.to(device)
     print(f'DONE ({time.time() - start:.2f}s)')
 
-def load_base_model(base_model, mask_model):
-    print('MOVING BASE MODEL TO GPU...', end='', flush=True)
+def load_base_model(base_model, mask_model, device: torch.device):
+    device_label = str(device).upper()
+    print(f'MOVING BASE MODEL TO {device_label}...', end='', flush=True)
     start = time.time()
-    try:
-        mask_model.cpu()
-    except NameError:
-        pass
-    base_model.to(DEVICE)
+    if device.type == "cuda":
+        try:
+            mask_model.to("cpu")
+        except NameError:
+            pass
+
+    base_model.to(device)
     print(f'DONE ({time.time() - start:.2f}s)')
 
 def perturb_texts(args, mask_model, mask_tokenizer, texts, span_length, pct, ceil_pct=False):
@@ -199,8 +234,8 @@ def get_ll(text, base_model, base_tokenizer):
 def get_lls(texts, base_model, base_tokenizer):
     return [get_ll(text, base_model, base_tokenizer) for text in texts]
 
-def get_perturbation_results(args, base_model, base_tokenizer, mask_model, mask_tokenizer, data, span_length=10, n_perturbations=1, n_samples=500):
-    load_mask_model(base_model, mask_model)
+def get_perturbation_results(args, base_model, base_tokenizer, mask_model, mask_tokenizer, data, device, span_length=10, n_perturbations=1, n_samples=500):
+    load_mask_model(base_model, mask_model, device)
 
     torch.manual_seed(0)
     np.random.seed(0)
@@ -230,7 +265,7 @@ def get_perturbation_results(args, base_model, base_tokenizer, mask_model, mask_
             "perturbed_original": p_original_text[idx * n_perturbations: (idx + 1) * n_perturbations]
         })
 
-    load_base_model(base_model, mask_model)
+    load_base_model(base_model, mask_model, device)
 
     for res in tqdm.tqdm(results, desc="Computing log likelihoods"):
         p_sampled_ll = get_lls(res["perturbed_sampled"], base_model, base_tokenizer)
@@ -345,17 +380,26 @@ def main():
     parser.add_argument('--buffer_size', type=int, default=1)
     parser.add_argument('--random_fills', action='store_true')
     parser.add_argument('--chunk_size', type=int, default=20)
+    parser.add_argument('--device', type=str, default="auto",
+                        help='Device to use: "auto", "cpu", "cuda", etc.')
     args = parser.parse_args()
 
     
     # Load base model and tokenizer
     print(f'Loading base model {args.base_model_name}...')
     base_model, base_tokenizer = load_base_model_and_tokenizer(args, args.base_model_name)
-    base_model = base_model.to(DEVICE)
-    
+
+    device = select_device(args.device)
+    print(f"Using device: {device}")
+
+    base_model = base_model.to(device)
+
+    global DEVICE
+    DEVICE = device
+
     # Load mask filling model and tokenizer
-    mask_model, mask_tokenizer = load_mask_model_and_tokenizer(args.mask_filling_model_name, DEVICE)
-    
+    mask_model, mask_tokenizer = load_mask_model_and_tokenizer(args.mask_filling_model_name, device)
+
     # Make models and tokenizers available globally as expected by original code
     globals().update({
         'base_model': base_model,
@@ -374,6 +418,7 @@ def main():
     perturbation_results = get_perturbation_results(
         args,
         base_model, base_tokenizer, mask_model, mask_tokenizer, data,
+        device,
         span_length=args.span_length,
         n_perturbations=args.n_perturbations,
         n_samples=len(data["original"])
