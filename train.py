@@ -162,7 +162,7 @@ def load_reviews(data_path: Path) -> pd.DataFrame:
     df["category"] = df.get("category", "unknown").astype(str).fillna("unknown")
     df["rating"] = pd.to_numeric(df.get("rating", np.nan), errors="coerce")
 
-    label_map = {"CG": 0, "OR": 1, 0: 0, 1: 1}
+    label_map = {"CG": 0, "OR": 1, "0": 0, "1": 1, 0: 0, 1: 1}
     if not set(df["label"]).issubset(label_map):
         raise ValueError("Labels must be 'CG' and 'OR' for generated and original reviews respectively")
 
